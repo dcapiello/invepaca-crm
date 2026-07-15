@@ -11,7 +11,8 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, doc, setDoc, getDoc, getDocs, addDoc, updateDoc,
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  collection, doc, setDoc, getDoc, getDocs, addDoc, updateDoc, deleteDoc,
   query, orderBy, onSnapshot, serverTimestamp }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
@@ -39,7 +40,14 @@ const TASA    = 86;
 let HOY = new Date().toISOString().slice(0,10);
 
 const fbApp = initializeApp(firebaseConfig);
-const db    = getFirestore(fbApp);
+let db;
+try{
+  // Caché offline: las visitas se guardan en el teléfono sin señal y sincronizan al reconectar
+  db = initializeFirestore(fbApp,{localCache:persistentLocalCache({tabManager:persistentMultipleTabManager()})});
+}catch(e){
+  console.warn("Caché offline no disponible:",e.message);
+  db = getFirestore(fbApp);
+}
 
 // ── CATÁLOGO ──
 const PFS=[
@@ -83,14 +91,14 @@ const PRETAIL=[{cat:"Retail Codificados",p:[
   {id:"r7",n:"Tequesitos! Queso x25u",pr:5.75}]}];
 
 const CLIENTES_SEED=[
-  {id:"c1",n:"Cines Unidos Sambil",t:"fs",cat:"Cine",z:"Caracas",etapa:"recurrente",vend:"javiergsoledad@gmail.com",saldo:0,credito:"contado",tel:"0212-555-0001"},
-  {id:"c2",n:"Abasto El Buen Precio",t:"fs",cat:"Abasto",z:"Caracas Este",etapa:"segundo",vend:"javiergsoledad@gmail.com",saldo:45,credito:"credito30",tel:"0412-555-0002"},
-  {id:"c3",n:"Cantina Col. Santa Ana",t:"fs",cat:"Colegio",z:"La Florida",etapa:"prospecto",vend:"javiergsoledad@gmail.com",saldo:0,credito:"contado",tel:"0416-555-0003"},
-  {id:"c4",n:"Farmatodo Las Mercedes",t:"retail",cat:"Cadena",z:"Las Mercedes",etapa:"recurrente",vend:"javiergsoledad@gmail.com",saldo:0,credito:"credito15",tel:"0212-555-0004"},
-  {id:"c5",n:"Rest. La Estancia",t:"fs",cat:"Restaurante",z:"Altamira",etapa:"primer",vend:"javiergsoledad@gmail.com",saldo:120,credito:"credito30",tel:"0424-555-0005"},
-  {id:"c6",n:"Abasto La Esquina",t:"fs",cat:"Abasto",z:"Chacao",etapa:"prospecto",vend:"vendedor.prueba.invepaca@gmail.com",saldo:0,credito:"contado",tel:"0412-555-0010"},
-  {id:"c7",n:"Cantina Liceo Andrés Bello",t:"fs",cat:"Colegio",z:"San Bernardino",etapa:"prospecto",vend:"vendedor.prueba.invepaca@gmail.com",saldo:0,credito:"contado",tel:"0416-555-0011"},
-  {id:"c8",n:"Snack Bar Club Caracas",t:"fs",cat:"Restaurante",z:"El Llanito",etapa:"prospecto",vend:"vendedor.prueba.invepaca@gmail.com",saldo:0,credito:"contado",tel:"0424-555-0012"},
+  {id:"c1",n:"Cines Unidos Sambil",t:"fs",cat:"Cine",z:"Caracas",etapa:"recurrente",vend:"javier",saldo:0,credito:"contado",tel:"0212-555-0001"},
+  {id:"c2",n:"Abasto El Buen Precio",t:"fs",cat:"Abasto",z:"Caracas Este",etapa:"segundo",vend:"javier",saldo:45,credito:"credito30",tel:"0412-555-0002"},
+  {id:"c3",n:"Cantina Col. Santa Ana",t:"fs",cat:"Colegio",z:"La Florida",etapa:"prospecto",vend:"javier",saldo:0,credito:"contado",tel:"0416-555-0003"},
+  {id:"c4",n:"Farmatodo Las Mercedes",t:"retail",cat:"Cadena",z:"Las Mercedes",etapa:"recurrente",vend:"javier",saldo:0,credito:"credito15",tel:"0212-555-0004"},
+  {id:"c5",n:"Rest. La Estancia",t:"fs",cat:"Restaurante",z:"Altamira",etapa:"primer",vend:"javier",saldo:120,credito:"credito30",tel:"0424-555-0005"},
+  {id:"c6",n:"Abasto La Esquina",t:"fs",cat:"Abasto",z:"Chacao",etapa:"prospecto",vend:"vendedorprueba",saldo:0,credito:"contado",tel:"0412-555-0010"},
+  {id:"c7",n:"Cantina Liceo Andrés Bello",t:"fs",cat:"Colegio",z:"San Bernardino",etapa:"prospecto",vend:"vendedorprueba",saldo:0,credito:"contado",tel:"0416-555-0011"},
+  {id:"c8",n:"Snack Bar Club Caracas",t:"fs",cat:"Restaurante",z:"El Llanito",etapa:"prospecto",vend:"vendedorprueba",saldo:0,credito:"contado",tel:"0424-555-0012"},
 ];
 
 const FUNNEL=[
@@ -160,8 +168,52 @@ function getFrase(arr){
 
 let CU=null, CLIENTES=[], VISITAS=[], PEDIDOS=[], pedido={}, tipoV="seguimiento", canalV="fs", resV="vendio", descPct=0, unsub=null, unsubP=null;
 
+// ── Registro global de errores (visible en Casa Matriz → Diagnóstico) ──
+let _errCount=0;
+function logError(tipo,msg,extra){
+  try{
+    if(_errCount>=10)return;
+    _errCount++;
+    addDoc(collection(db,"errores"),{
+      tipo,msg:String(msg).slice(0,500),extra:String(extra||"").slice(0,400),
+      usuario:(CU&&CU.name)||"sin sesión",
+      pantalla:document.querySelector(".screen.active")?.id||"?",
+      fecha:HOY,ts:serverTimestamp(),ua:navigator.userAgent.slice(0,120)
+    }).catch(()=>{});
+  }catch(e){}
+}
+window.addEventListener("error",e=>logError("error",e.message,(e.filename||"")+":"+(e.lineno||"")));
+window.addEventListener("unhandledrejection",e=>logError("promesa",(e.reason&&e.reason.message)||e.reason,""));
+
+// ── Indicador de conexión ──
+window.addEventListener("offline",()=>{const b=document.getElementById("offline-banner");if(b)b.style.display="block";});
+window.addEventListener("online",()=>{const b=document.getElementById("offline-banner");if(b)b.style.display="none";toast("✓ Conexión restablecida — sincronizando datos");});
+
 // ── UTILS ──
-function go(id){document.querySelectorAll(".screen").forEach(s=>s.classList.remove("active"));const el=document.getElementById(id);if(el){el.classList.add("active");window.scrollTo(0,0);}}
+const NAV_SCREENS=["s-home","s-ruta","s-metas","s-hist","s-catalogo-vend"];
+function go(id){
+  document.querySelectorAll(".screen").forEach(s=>s.classList.remove("active"));
+  const el=document.getElementById(id);
+  if(el){el.classList.add("active");window.scrollTo(0,0);}
+  const nav=document.getElementById("bottom-nav");
+  if(nav){
+    const show=CU&&!CU.isAdmin&&NAV_SCREENS.includes(id);
+    nav.style.display=show?"flex":"none";
+    if(show){
+      document.querySelectorAll(".bn-item").forEach(b=>b.classList.remove("on"));
+      const a=document.getElementById("bn-"+id);
+      if(a)a.classList.add("on");
+    }
+  }
+}
+window.navGo=function(id){
+  if(id==="s-ruta")renderRuta();
+  if(id==="s-visita")renderVisitaForm();
+  if(id==="s-metas")renderMetas();
+  if(id==="s-hist")renderHist();
+  if(id==="s-home")updHomeKPIs();
+  go(id);
+};
 function toast(m,t=3000){const el=document.getElementById("toast");el.textContent=m;el.classList.add("show");setTimeout(()=>el.classList.remove("show"),t);}
 function allProds(){return(canalV==="fs"?PFS:PRETAIL).flatMap(c=>c.p);}
 function fmt(n){return"$"+Number(n).toFixed(2);}
@@ -506,26 +558,25 @@ window.guardar=async function(){
       ...(resV==="vendio"?{ultimaCompra:HOY,etapa}:{})
     });
     await loadClientes();
-    // WhatsApp message
+    // Pantalla de éxito + resumen WhatsApp
+    const cSel=CLIENTES.find(x=>x.id===cid);
+    let waMsg="";
     if(wa&&items.length>0){
-      const c=CLIENTES.find(x=>x.id===cid);
-      const msg=`🧊 *Pedido Tequechongos!*\n\nCliente: ${c?.n}\nFecha: ${HOY}\n\n${items.map(i=>`• ${i.nombre} x${i.qty} = ${fmt(i.precio*i.qty*(1-descPct/100))}`).join("\n")}\n\n*Total: ${fmt(total)}*\n\n¡Gracias! 🤝`;
-      window._waMsg=msg;
-      document.getElementById("wa-preview").textContent=msg;
-      document.getElementById("wa-modal").style.display="flex";
+      waMsg="🧊 *Pedido Tequechongos!*\n\nCliente: "+(cSel?cSel.n:"")+"\nFecha: "+HOY+"\n\n"
+        +items.map(i=>"• "+i.nombre+" x"+i.qty+" = "+fmt(i.precio*i.qty*(1-descPct/100))).join("\n")
+        +"\n\n*Total: "+fmt(total)+"*\n\n¡Gracias! 🤝";
     }
+    mostrarExito({cliente:(cSel?cSel.n:"Cliente"),tipo:tipoV,total,cob,waMsg});
     pedido={};document.getElementById("f-cob").value="";document.getElementById("f-notas").value="";document.getElementById("f-wa").checked=false;document.getElementById("f-foto").value="";document.getElementById("f-desc").value="0";descPct=0;
     renderProds();
-    toast(wa?"✓ Visita y pedido guardados":"⚠️ Guardado. Acordate del WhatsApp");
-    if(!wa)setTimeout(()=>go("s-home"),1300);
   }catch(e){toast("❌ Error: "+e.message,5000);}
   btn.textContent="💾 Guardar Visita";btn.disabled=false;
 };
 
 window.copyWA=function(){
-  navigator.clipboard.writeText(window._waMsg||"").then(()=>toast("✓ Copiado al portapapeles"));
-  document.getElementById("wa-modal").style.display="none";
-  setTimeout(()=>go("s-home"),500);
+  navigator.clipboard.writeText(window._waMsg||"")
+    .then(()=>toast("✓ Copiado — pégalo en el WhatsApp del cliente"))
+    .catch(()=>toast("⚠️ No se pudo copiar automáticamente"));
 };
 window.closeWA=function(){document.getElementById("wa-modal").style.display="none";setTimeout(()=>go("s-home"),300);};
 
@@ -690,7 +741,8 @@ function renderTab(tab){
     </div>
     <div class="ac"><div class="ac-title">📅 Actividad últimos 14 días</div>
       <div style="position:relative;height:200px"><canvas id="chart-actividad"></canvas></div>
-    </div>`;
+    </div>
+    <div style="text-align:right;margin-top:2px"><button onclick="verErrores()" style="background:none;border:none;color:var(--t3);font-size:11px;cursor:pointer;font-family:inherit;text-decoration:underline">🛠️ Diagnóstico del sistema</button></div>`;
     // Render charts after DOM update
     setTimeout(()=>{
       renderCharts();
@@ -738,29 +790,20 @@ function renderTab(tab){
   }
 
   else if(tab==="clientes"){
-    const EL={prospecto:"Prospecto",primer:"1er Pedido",segundo:"2do ⭐",recurrente:"Recurrente"};
-    const EC={prospecto:"badge-g",primer:"badge-n",segundo:"badge-a",recurrente:"badge-v"};
     el.innerHTML=`<div class="ac">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <div class="ac-title" style="margin-bottom:0">Base de Clientes (${CLIENTES.length})</div>
-        <button onclick="exportarExcel('clientes')" style="background:var(--verde);color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit">⬇️ Exportar Excel</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">
+        <div class="ac-title" style="margin-bottom:0">Base de Clientes (<span id="cli-count">${CLIENTES.length}</span>)</div>
+        <div style="display:flex;gap:8px;flex:1;justify-content:flex-end;min-width:280px">
+          <input type="text" class="finp" placeholder="🔍 Buscar por nombre, zona, RIF, categoría..."
+            style="max-width:340px;padding:9px 12px;font-size:13px" oninput="buscarClientes(this.value)">
+          <button onclick="exportarExcel('clientes')" style="background:var(--verde);color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;flex-shrink:0">⬇️ Exportar</button>
+        </div>
       </div>
       <table class="tbl"><thead><tr>
         <th class="th">Cliente</th><th class="th">Canal</th><th class="th">Zona</th>
         <th class="th">Etapa</th><th class="th">Vendedor</th><th class="th">Últ. visita</th><th class="th">Saldo</th>
-      </tr></thead><tbody>
-      ${CLIENTES.map(c=>`<tr>
-        <td class="td" style="font-weight:600">${c.n}</td>
-        <td class="td"><span class="badge ${c.t==="retail"?"badge-b":"badge-n"}">${c.t==="retail"?"🏪":"🍽️"} ${c.cat}</span></td>
-        <td class="td">${c.z}</td>
-        <td class="td"><span class="badge ${EC[c.etapa]||"badge-g"}">${EL[c.etapa]||c.etapa}</span></td>
-        <td class="td" style="font-size:12px">${c.vend.split("@")[0]}</td>
-        <td class="td" style="font-size:12px;color:${daysDiff(c.ultimaVisita)>14?"var(--rojo)":"var(--t3)"}">${c.ultimaVisita?fmtDate(c.ultimaVisita):"—"}</td>
-        <td class="td" style="color:${c.saldo>0?"var(--rojo)":"var(--verde)"};font-weight:700">${c.saldo>0?fmt(c.saldo):"✓"}</td>
-      </tr>`).join("")}
-      </tbody></table></div>`;
+      </tr></thead><tbody id="tbody-cli">${renderFilasClientes(CLIENTES)}</tbody></table></div>`;
   }
-
   else if(tab==="reportes"){
     const vEmails=[...new Set(CLIENTES.map(c=>c.vend))];
     const fsT=VISITAS.filter(v=>v.canal==="fs").reduce((s,v)=>s+v.total,0);
@@ -1422,43 +1465,22 @@ async function loadUsuarios(){
 
 
 window.resetSistema = async function(){
-  const confirm1 = window.confirm("⚠️ RESET DEL SISTEMA\n\nEsto eliminará TODAS las visitas y pedidos de prueba.\nLos clientes se mantendrán.\n\n¿Estás seguro?");
-  if(!confirm1) return;
-  const pin = window.prompt("Ingresa tu PIN de administrador para confirmar:");
-  if(!pin || pin !== CU?.pin){
-    // Find current user pin
-    const u = USUARIOS.find(x=>x.id===CU?.id);
-    if(!u || pin !== u.pin){
-      toast("❌ PIN incorrecto. Reset cancelado.");
-      return;
-    }
-  }
-  toast("🔄 Limpiando datos de prueba...", 5000);
+  const confirm1=window.confirm("⚠️ RESET DEL SISTEMA\n\nEsto eliminará TODAS las visitas y pedidos registrados.\nLos clientes y usuarios se mantienen.\n\n¿Estás seguro?");
+  if(!confirm1)return;
+  const pin=window.prompt("Ingresa tu PIN de administrador para confirmar:");
+  const u=USUARIOS.find(x=>x.id===(CU&&CU.id));
+  if(!u||pin!==u.pin){toast("❌ PIN incorrecto. Reset cancelado.");return;}
+  toast("🔄 Limpiando datos...",6000);
   try{
-    // Delete all visitas
-    const vSnap = await getDocs(collection(db,"visitas"));
-    for(const d of vSnap.docs) await d.ref.delete ? d.ref.delete() : updateDoc(d.ref,{_deleted:true});
-    // Delete all pedidos
-    const pSnap = await getDocs(collection(db,"pedidos"));
-    for(const d of pSnap.docs) await d.ref.delete ? d.ref.delete() : updateDoc(d.ref,{_deleted:true});
+    const vSnap=await getDocs(collection(db,"visitas"));
+    for(const d of vSnap.docs)await deleteDoc(d.ref);
+    const pSnap=await getDocs(collection(db,"pedidos"));
+    for(const d of pSnap.docs)await deleteDoc(d.ref);
     VISITAS=[];PEDIDOS=[];
     toast("✅ Sistema limpio. Listo para arrancar con datos reales.");
     renderTab("dashboard");
-  } catch(e){
-    // Use Firestore delete properly
-    const {deleteDoc} = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js");
-    try{
-      const vSnap2 = await getDocs(collection(db,"visitas"));
-      for(const d of vSnap2.docs) await deleteDoc(d.ref);
-      const pSnap2 = await getDocs(collection(db,"pedidos"));
-      for(const d of pSnap2.docs) await deleteDoc(d.ref);
-      VISITAS=[];PEDIDOS=[];
-      toast("✅ Sistema limpio. Listo para datos reales.");
-      renderTab("dashboard");
-    }catch(e2){toast("❌ Error: "+e2.message,5000);}
-  }
+  }catch(e){toast("❌ Error: "+e.message,5000);}
 };
-
 
 window.verDetalleVendedor = function(email, nombre){
   const TIPO_ICON={prospecto:"🔍",seguimiento:"🤝",cierre:"✅",cobranza:"💰",despacho:"🚚",acomodo:"🛒"};
@@ -1543,6 +1565,78 @@ window.verDetalleVendedor = function(email, nombre){
   };
   
   el.innerHTML = renderDetalle(periodoActual);
+};
+
+
+window.descargarRespaldo=function(){
+  const data={
+    generado:new Date().toISOString(),
+    generadoPor:(CU&&CU.name)||"",
+    clientes:CLIENTES,visitas:VISITAS,pedidos:PEDIDOS,
+    usuarios:USUARIOS.map(u=>({id:u.id,nombre:u.nombre,usuario:u.usuario,rol:u.rol,activo:u.activo}))
+  };
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download="invepaca_respaldo_"+HOY+".json";a.click();
+  URL.revokeObjectURL(url);
+  toast("✓ Respaldo descargado — guárdalo en un lugar seguro");
+};
+
+
+window.verErrores=async function(){
+  const el=document.getElementById("adm-content");
+  el.innerHTML="<p class='empty-msg'>Cargando registro de errores...</p>";
+  try{
+    const snap=await getDocs(query(collection(db,"errores"),orderBy("ts","desc")));
+    const errs=snap.docs.slice(0,50).map(d=>d.data());
+    el.innerHTML=`<div style="margin-bottom:14px"><button onclick="renderTab('dashboard')" style="background:var(--gris);border:none;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit">← Volver al Dashboard</button></div>
+    <div class="ac"><div class="ac-title">🛠️ Registro de errores del sistema (últimos ${errs.length})</div>
+    ${errs.length===0?"<p class='empty-msg'>Sin errores registrados 🎉 El sistema está funcionando limpio.</p>":errs.map(e=>`
+      <div style="padding:10px 0;border-bottom:1px solid var(--gris);font-size:12px">
+        <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px">
+          <b>${e.fecha||""} · ${e.usuario||""}</b>
+          <span style="color:var(--t3)">${e.pantalla||""} · ${e.tipo||""}</span>
+        </div>
+        <div style="color:var(--rojo);margin-top:3px;word-break:break-word">${(e.msg||"").slice(0,200)}</div>
+        ${e.extra?`<div style="color:var(--t3);margin-top:2px;word-break:break-word">${String(e.extra).slice(0,150)}</div>`:""}
+      </div>`).join("")}</div>`;
+  }catch(e){el.innerHTML="<p class='empty-msg'>No se pudo cargar el registro: "+e.message+"</p>";}
+};
+
+
+function mostrarExito({cliente,tipo,total,cob,waMsg}){
+  const TIPO_LBL={prospecto:"🔍 Prospecto",seguimiento:"🤝 Seguimiento",cierre:"✅ Cierre",cobranza:"💰 Cobranza",despacho:"🚚 Despacho",acomodo:"🛒 Acomodo de anaquel"};
+  document.getElementById("exito-cliente").textContent=cliente;
+  document.getElementById("exito-tipo").textContent=TIPO_LBL[tipo]||tipo;
+  document.getElementById("exito-montos").innerHTML=total>0
+    ?`<div>Pedido: <b style="color:var(--azul)">${fmt(total)}</b></div><div>Cobrado: <b style="color:var(--verde)">${fmt(cob)}</b></div>`
+    :"";
+  window._waMsg=waMsg||"";
+  document.getElementById("exito-wa").style.display=waMsg?"block":"none";
+  go("s-exito");
+}
+
+
+function renderFilasClientes(lista){
+  const EL={prospecto:"Prospecto",primer:"1er Pedido",segundo:"2do ⭐",recurrente:"Recurrente",operativo:"Operativo"};
+  const EC={prospecto:"badge-g",primer:"badge-n",segundo:"badge-a",recurrente:"badge-v"};
+  if(lista.length===0)return `<tr><td class="td" colspan="7" style="text-align:center;color:var(--t3);padding:24px">Sin resultados para esa búsqueda</td></tr>`;
+  return lista.map(c=>`<tr>
+    <td class="td" style="font-weight:600">${c.n}</td>
+    <td class="td"><span class="badge ${c.t==="retail"?"badge-b":"badge-n"}">${c.t==="retail"?"🏪":"🍽️"} ${c.cat}</span></td>
+    <td class="td">${c.z}</td>
+    <td class="td"><span class="badge ${EC[c.etapa]||"badge-g"}">${EL[c.etapa]||c.etapa}</span></td>
+    <td class="td" style="font-size:12px">${(c.vend||"").split("@")[0]}</td>
+    <td class="td" style="font-size:12px;color:${daysDiff(c.ultimaVisita)>14?"var(--rojo)":"var(--t3)"}">${c.ultimaVisita?fmtDate(c.ultimaVisita):"—"}</td>
+    <td class="td" style="color:${c.saldo>0?"var(--rojo)":"var(--verde)"};font-weight:700">${c.saldo>0?fmt(c.saldo):"✓"}</td>
+  </tr>`).join("");
+}
+window.buscarClientes=function(q){
+  q=(q||"").toLowerCase().trim();
+  const lista=!q?CLIENTES:CLIENTES.filter(c=>[c.n,c.z,c.cat,c.rif,c.propietario,c.contacto].some(v=>(v||"").toLowerCase().includes(q)));
+  const tb=document.getElementById("tbody-cli");if(tb)tb.innerHTML=renderFilasClientes(lista);
+  const cc=document.getElementById("cli-count");if(cc)cc.textContent=lista.length;
 };
 
 window.go=go;window.renderRuta=()=>renderRuta();
@@ -1845,6 +1939,14 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--page);color:var
 .tbl{width:100%;border-collapse:collapse}
 .th{text-align:left;padding:10px 13px;font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid var(--gris2)}
 .td{padding:12px 13px;font-size:13px;border-bottom:1px solid var(--gris);color:var(--text)}
+
+#offline-banner{position:fixed;top:0;left:0;right:0;background:#C0392B;color:#fff;font-size:12px;font-weight:600;padding:8px 12px;text-align:center;z-index:10000;display:none}
+#bottom-nav{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--gris2);display:none;justify-content:space-around;align-items:flex-end;padding:6px 4px calc(8px + env(safe-area-inset-bottom));z-index:600;box-shadow:0 -2px 14px rgba(0,0,0,.09)}
+.bn-item{background:none;border:none;display:flex;flex-direction:column;align-items:center;gap:1px;font-size:19px;color:var(--gris3);cursor:pointer;font-family:inherit;padding:3px 10px;border-radius:8px}
+.bn-item span{font-size:10px;font-weight:600}
+.bn-item.on{color:var(--naranja)}
+.bn-visita{background:linear-gradient(135deg,var(--naranja),#F07820);border:none;width:50px;height:50px;border-radius:50%;color:#fff;font-size:22px;cursor:pointer;box-shadow:0 4px 14px rgba(232,98,10,.45);margin-top:-20px;font-family:inherit;flex-shrink:0}
+#s-home{padding-bottom:74px}
 </style>
 </head>
 <body>
@@ -1856,6 +1958,16 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--page);color:var
 </div>
 
 <div id="toast" class="toast"></div>
+
+<div id="offline-banner">📡 Sin conexión — tus registros se guardan en el teléfono y se sincronizan al volver la señal</div>
+
+<div id="bottom-nav">
+  <button onclick="navGo('s-home')" class="bn-item" id="bn-s-home">🏠<span>Inicio</span></button>
+  <button onclick="navGo('s-ruta')" class="bn-item" id="bn-s-ruta">🗺️<span>Ruta</span></button>
+  <button onclick="navGo('s-visita')" class="bn-visita">➕</button>
+  <button onclick="navGo('s-metas')" class="bn-item" id="bn-s-metas">📊<span>Metas</span></button>
+  <button onclick="navGo('s-hist')" class="bn-item" id="bn-s-hist">📁<span>Historial</span></button>
+</div>
 
 <!-- WA MODAL -->
 <div class="modal" id="wa-modal">
@@ -2109,6 +2221,24 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--page);color:var
   <div class="scroll pb"><div class="section" id="hist-list"></div></div>
 </div>
 
+<!-- ÉXITO -->
+<div class="screen" id="s-exito">
+  <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px 24px;background:var(--page);min-height:100vh">
+    <div style="width:84px;height:84px;border-radius:50%;background:var(--verde-light);display:flex;align-items:center;justify-content:center;font-size:42px;margin-bottom:18px">✅</div>
+    <div style="font-size:21px;font-weight:800;margin-bottom:6px">¡Visita guardada!</div>
+    <div style="font-size:15px;color:var(--text);font-weight:600;margin-bottom:2px" id="exito-cliente"></div>
+    <div style="font-size:12px;color:var(--t3);margin-bottom:14px" id="exito-tipo"></div>
+    <div id="exito-montos" style="display:flex;gap:20px;font-size:14px;color:var(--t2);margin-bottom:24px"></div>
+    <div id="exito-wa" style="display:none;width:100%;max-width:340px;margin-bottom:12px">
+      <button class="wa-btn" onclick="copyWA()">💬 Copiar resumen para WhatsApp</button>
+    </div>
+    <div style="width:100%;max-width:340px;display:flex;flex-direction:column;gap:10px">
+      <button class="btn-pri" onclick="go('s-visita');renderVisitaForm()">➕ Registrar otra visita</button>
+      <button class="btn-sec" onclick="navGo('s-home')">🏠 Ir al inicio</button>
+    </div>
+  </div>
+</div>
+
 <!-- ADMIN -->
 <div class="screen" id="s-admin">
   <div class="admin-layout">
@@ -2133,6 +2263,7 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--page);color:var
           <div><div class="admin-uname">Casa Matriz</div><div class="admin-urole">dcapiello@tequechongos.com</div></div>
         </div>
         <button class="logout-btn" onclick="doLogout()">Cerrar sesión</button>
+        <button onclick="descargarRespaldo()" style="margin-top:8px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:8px 12px;color:rgba(255,255,255,.8);font-size:11px;cursor:pointer;width:100%;font-family:inherit">💾 Respaldo de datos</button>
         <button onclick="resetSistema()" style="margin-top:8px;background:rgba(192,57,43,.2);border:1px solid rgba(192,57,43,.4);border-radius:7px;padding:8px 12px;color:#ff9999;font-size:11px;cursor:pointer;width:100%;font-family:inherit">⚠️ Reset del sistema</button>
       </div>
     </div>
