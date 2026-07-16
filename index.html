@@ -13,7 +13,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import { getAuth, signInAnonymously, signOut }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-import { getFirestore, collection, doc, setDoc, getDoc, getDocs, addDoc, updateDoc,
+import { getFirestore, collection, doc, setDoc, getDoc, getDocs, addDoc, updateDoc, deleteDoc,
   query, where, orderBy, onSnapshot, serverTimestamp, Timestamp }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 // Storage no usado (plan Spark) — fotos en base64 dentro de Firestore
@@ -301,7 +301,7 @@ window.entrarComo=async function(rol){
 
 // ── VERSIÓN ──
 // Actualizar en cada cambio. Visible en el login y en consola.
-const APP_VERSION="v3.0 · 2026-07-16 · PIN + Reportes de gestión";
+const APP_VERSION="v3.1 · 2026-07-16 · PIN individual + Reset + Stats clickeables";
 console.log("Invepaca CRM",APP_VERSION);
 
 // ── LOGIN POR PIN ──
@@ -315,9 +315,34 @@ const USUARIOS_SISTEMA=[
   {u:"henrriz",       nombre:"Henrriz García",   email:"henrriz@tequechongos.com",             rol:"vendedor", dual:false, color:"#2E8B4A"},
   {u:"vendedorprueba",nombre:"Vendedor Prueba",  email:"vendedor.prueba.invepaca@gmail.com",   rol:"vendedor", dual:false, color:"#888"},
 ];
-const PIN_ADMIN="7890";
-const PIN_VENDEDOR="1234";
+const PIN_ADMIN="7890";   // PIN por defecto Casa Matriz (seed inicial)
+const PIN_VENDEDOR="1234"; // PIN por defecto vendedores (seed inicial)
 const SESSION_KEY="invepaca_sesion_v1";
+let USUARIOS_CACHE=[]; // usuarios cargados desde Firestore
+
+async function cargarUsuarios(){
+  try{
+    const snap=await getDocs(collection(db,"usuarios"));
+    const docs=snap.docs.map(d=>({id:d.id,...d.data()}));
+    // Solo docs del formato PIN (con campos u y pin). Los del sistema Gmail viejo se ignoran.
+    const validos=docs.filter(d=>d.pin&&d.u);
+    if(validos.length===0){
+      // Seed inicial
+      for(const u of USUARIOS_SISTEMA){
+        await setDoc(doc(db,"usuarios",u.u),{
+          u:u.u,nombre:u.nombre,email:u.email,rol:u.rol,dual:!!u.dual,color:u.color,
+          pin:u.rol==="admin"?PIN_ADMIN:PIN_VENDEDOR,activo:true,creadoEn:HOY
+        });
+      }
+      USUARIOS_CACHE=USUARIOS_SISTEMA.map(u=>({...u,id:u.u,pin:u.rol==="admin"?PIN_ADMIN:PIN_VENDEDOR,activo:true}));
+    } else {
+      USUARIOS_CACHE=validos;
+    }
+  }catch(e){
+    console.warn("No se pudieron cargar usuarios de Firestore, usando lista local:",e);
+    USUARIOS_CACHE=USUARIOS_SISTEMA.map(u=>({...u,id:u.u,pin:u.rol==="admin"?PIN_ADMIN:PIN_VENDEDOR,activo:true}));
+  }
+}
 
 let _loginUserSel=null;
 let _pinBuffer="";
@@ -325,18 +350,19 @@ let _pinBuffer="";
 window.renderLoginUsuarios=function(){
   const box=document.getElementById("login-usuarios");
   if(!box)return;
-  box.innerHTML=USUARIOS_SISTEMA.map(u=>`
+  const activos=USUARIOS_CACHE.filter(u=>u.activo!==false);
+  box.innerHTML=activos.map(u=>`
     <button class="login-user-btn" onclick="seleccionarUsuario('${u.u}')">
-      <div class="login-user-av" style="background:${u.color}">${u.nombre.split(" ").map(p=>p[0]).join("").slice(0,2).toUpperCase()}</div>
+      <div class="login-user-av" style="background:${u.color||'#1A4FA0'}">${(u.nombre||u.u).split(" ").map(p=>p[0]).join("").slice(0,2).toUpperCase()}</div>
       <div>
-        <div style="font-size:13px;font-weight:700;color:var(--text)">${u.nombre}</div>
+        <div style="font-size:13px;font-weight:700;color:var(--text)">${u.nombre||u.u}</div>
         <div style="font-size:11px;color:var(--t3)">${u.rol==="admin"?"🏪 Casa Matriz":"📱 Vendedor"}${u.dual?" · dual":""}</div>
       </div>
     </button>`).join("");
 };
 
 window.seleccionarUsuario=function(uid){
-  _loginUserSel=USUARIOS_SISTEMA.find(x=>x.u===uid);
+  _loginUserSel=USUARIOS_CACHE.find(x=>x.u===uid);
   if(!_loginUserSel)return;
   _pinBuffer="";
   actualizarPinDots();
@@ -372,7 +398,7 @@ window.pinBorrar=function(){
 };
 
 async function validarPin(){
-  const pinCorrecto=_loginUserSel.rol==="admin"?PIN_ADMIN:PIN_VENDEDOR;
+  const pinCorrecto=_loginUserSel.pin||(_loginUserSel.rol==="admin"?PIN_ADMIN:PIN_VENDEDOR);
   if(_pinBuffer!==pinCorrecto){
     _pinBuffer="";
     actualizarPinDots();
@@ -387,15 +413,14 @@ async function validarPin(){
 }
 
 async function arrancarSesion(u,rolElegido){
-  try{
-    // Anonymous auth para satisfacer las reglas de Firestore (request.auth != null)
-    await signInAnonymously(auth);
-  }catch(e){
-    document.getElementById("loading").style.display="none";
-    const errEl=document.getElementById("auth-err");
-    errEl.style.display="block";
-    errEl.textContent="Error de conexión: "+e.message+". Verifica que Anonymous esté habilitado en Firebase Auth.";
-    go("s-login");renderLoginUsuarios();return;
+  if(!auth.currentUser){
+    try{await signInAnonymously(auth);}catch(e){
+      document.getElementById("loading").style.display="none";
+      const errEl=document.getElementById("auth-err");
+      errEl.style.display="block";
+      errEl.textContent="Error de conexión: "+e.message;
+      go("s-login");renderLoginUsuarios();return;
+    }
   }
   CU={email:u.email,name:u.nombre,photo:null,isAdmin:u.rol==="admin"};
   try{
@@ -421,12 +446,20 @@ async function arrancarSesion(u,rolElegido){
 
 // Restaurar sesión al cargar la página
 (async function initSesion(){
+  try{await signInAnonymously(auth);}catch(e){
+    console.error("Anonymous auth error:",e);
+    document.getElementById("loading").style.display="none";
+    const errEl=document.getElementById("auth-err");
+    if(errEl){errEl.style.display="block";errEl.textContent="Error de conexión con Firebase: "+e.message+". Verifica que Anonymous esté habilitado en Authentication.";}
+    go("s-login");return;
+  }
+  await cargarUsuarios();
   const saved=localStorage.getItem(SESSION_KEY);
   if(saved){
     try{
       const s=JSON.parse(saved);
-      const u=USUARIOS_SISTEMA.find(x=>x.u===s.u);
-      if(u){await arrancarSesion(u);return;}
+      const u=USUARIOS_CACHE.find(x=>x.u===s.u);
+      if(u&&u.activo!==false){await arrancarSesion(u);return;}
     }catch(e){console.warn("Sesión inválida:",e);}
     localStorage.removeItem(SESSION_KEY);
   }
@@ -982,25 +1015,25 @@ function renderTab(tab){
     el.innerHTML=`
     ${alertasAdmin.length>0?`<div class="alertas-panel">${alertasAdmin.slice(0,4).map(a=>`<div class="alerta-item alerta-${a.tipo}">⚠️ ${a.msg}</div>`).join("")}</div>`:""}
     <div class="stat-grid-4">
-      <div class="stat-card" style="border-top-color:var(--azul)">
+      <div class="stat-card" onclick="verDetalle('visitas',0,null)" style="border-top-color:var(--azul);cursor:pointer">
         <div class="stat-val" style="color:var(--azul)">${hoy.length}</div>
-        <div class="stat-lbl">Visitas hoy</div>
+        <div class="stat-lbl">Visitas hoy ›</div>
         <div style="font-size:11px;color:var(--t3);margin-top:4px">${semana.length} esta semana</div>
       </div>
-      <div class="stat-card" style="border-top-color:var(--verde)">
+      <div class="stat-card" onclick="verDetalle('cobrado',30,null)" style="border-top-color:var(--verde);cursor:pointer">
         <div class="stat-val" style="color:var(--verde)">${fmt(tc)}</div>
-        <div class="stat-lbl">Cobrado (mes)</div>
+        <div class="stat-lbl">Cobrado (mes) ›</div>
         <div style="font-size:11px;color:var(--t3);margin-top:4px">${fmt(hoy.reduce((s,v)=>s+v.cob,0))} hoy</div>
       </div>
-      <div class="stat-card" style="border-top-color:var(--naranja)">
+      <div class="stat-card" onclick="verDetalle('vendido',30,null)" style="border-top-color:var(--naranja);cursor:pointer">
         <div class="stat-val" style="color:var(--naranja)">${fmt(tv)}</div>
-        <div class="stat-lbl">Vendido (mes)</div>
+        <div class="stat-lbl">Vendido (mes) ›</div>
         <div style="font-size:11px;color:var(--t3);margin-top:4px">${fmt(tv-tc)} pendiente cobro</div>
       </div>
-      <div class="stat-card" style="border-top-color:var(--rojo)">
+      <div class="stat-card" onclick="verDetalle('pedidosPendientes',0,null)" style="border-top-color:var(--rojo);cursor:pointer">
         <div class="stat-val" style="color:${pendP>0?"var(--rojo)":"var(--verde)"}">${pendP>0?pendP:"✓"}</div>
-        <div class="stat-lbl">Pedidos pendientes</div>
-        <div style="font-size:11px;color:var(--t3);margin-top:4px">Saldos: ${fmt(sld)}</div>
+        <div class="stat-lbl">Pedidos pendientes ›</div>
+        <div style="font-size:11px;color:var(--t3);margin-top:4px;cursor:pointer" onclick="event.stopPropagation();verDetalle('saldos',0,null)">Saldos: ${fmt(sld)} ›</div>
       </div>
     </div>
     <div class="ac" style="margin-bottom:16px">
@@ -1770,22 +1803,22 @@ window.renderReporteDia=function(periodo){
       <div style="font-size:12px;opacity:.75;font-weight:600;text-transform:uppercase;letter-spacing:.5px">${PERIODO_LBL[dias]} · ${HOY}</div>
       <div style="font-size:15px;font-weight:700;margin-top:4px">${CU.name}</div>
       <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:14px">
-        <div><div style="font-size:26px;font-weight:800">${d.visHoy.length}</div><div style="font-size:11px;opacity:.75">Visitas</div></div>
-        <div><div style="font-size:26px;font-weight:800">${d.ventas.length}</div><div style="font-size:11px;opacity:.75">Ventas cerradas</div></div>
-        <div><div style="font-size:22px;font-weight:800;font-family:'DM Mono',monospace">${fmt(d.totalVendido)}</div><div style="font-size:11px;opacity:.75">Vendido</div></div>
-        <div><div style="font-size:22px;font-weight:800;font-family:'DM Mono',monospace;color:#7BE495">${fmt(d.totalCobrado)}</div><div style="font-size:11px;opacity:.75">Cobrado</div></div>
+        <div onclick="verDetalle('visitas',${dias},CU.email)" style="cursor:pointer"><div style="font-size:26px;font-weight:800">${d.visHoy.length}</div><div style="font-size:11px;opacity:.75">Visitas ›</div></div>
+        <div onclick="verDetalle('ventas',${dias},CU.email)" style="cursor:pointer"><div style="font-size:26px;font-weight:800">${d.ventas.length}</div><div style="font-size:11px;opacity:.75">Ventas cerradas ›</div></div>
+        <div onclick="verDetalle('vendido',${dias},CU.email)" style="cursor:pointer"><div style="font-size:22px;font-weight:800;font-family:'DM Mono',monospace">${fmt(d.totalVendido)}</div><div style="font-size:11px;opacity:.75">Vendido ›</div></div>
+        <div onclick="verDetalle('cobrado',${dias},CU.email)" style="cursor:pointer"><div style="font-size:22px;font-weight:800;font-family:'DM Mono',monospace;color:#7BE495">${fmt(d.totalCobrado)}</div><div style="font-size:11px;opacity:.75">Cobrado ›</div></div>
       </div>
     </div>
     <div class="card" style="margin-bottom:12px"><div class="sec-title">📊 Indicadores de gestión</div>
       <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px">
         ${[
-          ["Tasa de cierre",d.tasaCierre.toFixed(1)+"%","var(--verde)","Ventas / visitas comerciales"],
-          ["Ticket promedio",fmt(d.ticketProm),"var(--azul)","Valor promedio por venta"],
-          ["Visitas por día",d.visitasPorDia.toFixed(1),"var(--naranja)",dias===0?"Hoy":`En ${d.diasActivos} días activos`],
-          ["Clientes visitados",d.clientesUnicos,"var(--azul-mid)","Clientes únicos atendidos"]
-        ].map(([l,v,col,sub])=>`
-        <div style="background:var(--gris);border-radius:10px;padding:12px">
-          <div style="font-size:19px;font-weight:800;color:${col}">${v}</div>
+          ["Tasa de cierre",d.tasaCierre.toFixed(1)+"%","var(--verde)","Ventas / visitas comerciales","comerciales"],
+          ["Ticket promedio",fmt(d.ticketProm),"var(--azul)","Valor promedio por venta","ventas"],
+          ["Visitas por día",d.visitasPorDia.toFixed(1),"var(--naranja)",dias===0?"Hoy":`En ${d.diasActivos} días activos`,"visitas"],
+          ["Clientes visitados",d.clientesUnicos,"var(--azul-mid)","Clientes únicos atendidos","clientesUnicos"]
+        ].map(([l,v,col,sub,tipo])=>`
+        <div onclick="verDetalle('${tipo}',${dias},CU.email)" style="background:var(--gris);border-radius:10px;padding:12px;cursor:pointer">
+          <div style="font-size:19px;font-weight:800;color:${col}">${v} ›</div>
           <div style="font-size:11px;font-weight:700;margin-top:2px">${l}</div>
           <div style="font-size:10px;color:var(--t3);margin-top:1px">${sub}</div>
         </div>`).join("")}
@@ -1871,10 +1904,10 @@ function renderReporteAdmin(){
   box.innerHTML=`
     <div style="display:flex;gap:8px;margin-bottom:14px">${selBtn(0,"Hoy")}${selBtn(7,"Semana")}${selBtn(30,"Mes")}</div>
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px">
-      <div style="background:var(--gris);border-radius:10px;padding:12px;text-align:center"><div style="font-size:24px;font-weight:800;color:var(--azul)">${dTotal.visHoy.length}</div><div style="font-size:11px;color:var(--t3)">Visitas totales</div></div>
-      <div style="background:var(--gris);border-radius:10px;padding:12px;text-align:center"><div style="font-size:24px;font-weight:800;color:var(--verde)">${dTotal.ventas.length}</div><div style="font-size:11px;color:var(--t3)">Ventas</div></div>
-      <div style="background:var(--gris);border-radius:10px;padding:12px;text-align:center"><div style="font-size:20px;font-weight:800;color:var(--naranja);font-family:'DM Mono',monospace">${fmt(dTotal.totalVendido)}</div><div style="font-size:11px;color:var(--t3)">Vendido</div></div>
-      <div style="background:var(--gris);border-radius:10px;padding:12px;text-align:center"><div style="font-size:20px;font-weight:800;color:var(--verde);font-family:'DM Mono',monospace">${fmt(dTotal.totalCobrado)}</div><div style="font-size:11px;color:var(--t3)">Cobrado</div></div>
+      <div onclick="verDetalle('visitas',${dias},null)" style="background:var(--gris);border-radius:10px;padding:12px;text-align:center;cursor:pointer"><div style="font-size:24px;font-weight:800;color:var(--azul)">${dTotal.visHoy.length}</div><div style="font-size:11px;color:var(--t3)">Visitas totales ›</div></div>
+      <div onclick="verDetalle('ventas',${dias},null)" style="background:var(--gris);border-radius:10px;padding:12px;text-align:center;cursor:pointer"><div style="font-size:24px;font-weight:800;color:var(--verde)">${dTotal.ventas.length}</div><div style="font-size:11px;color:var(--t3)">Ventas ›</div></div>
+      <div onclick="verDetalle('vendido',${dias},null)" style="background:var(--gris);border-radius:10px;padding:12px;text-align:center;cursor:pointer"><div style="font-size:20px;font-weight:800;color:var(--naranja);font-family:'DM Mono',monospace">${fmt(dTotal.totalVendido)}</div><div style="font-size:11px;color:var(--t3)">Vendido ›</div></div>
+      <div onclick="verDetalle('cobrado',${dias},null)" style="background:var(--gris);border-radius:10px;padding:12px;text-align:center;cursor:pointer"><div style="font-size:20px;font-weight:800;color:var(--verde);font-family:'DM Mono',monospace">${fmt(dTotal.totalCobrado)}</div><div style="font-size:11px;color:var(--t3)">Cobrado ›</div></div>
     </div>
     ${vendedores.length===0?`<p style="font-size:13px;color:var(--t3)">Sin actividad registrada en este período.</p>`:`
     <div class="ac-title" style="font-size:13px">📊 Comparativo de gestión por vendedor</div>
@@ -1939,78 +1972,269 @@ window.compartirReporteAdminWA=function(){
   window.open(`https://wa.me/?text=${encodeURIComponent(txt)}`,"_blank");
 };
 
-// ── GESTIÓN DE USUARIOS ──
+
+// ── DETALLE CLICKEABLE DE ESTADÍSTICAS ──
+window.cerrarDetalle=function(){document.getElementById("detalle-modal").style.display="none";};
+
+window.verDetalle=function(tipo,dias,vend){
+  const modal=document.getElementById("detalle-modal");
+  const tEl=document.getElementById("detalle-titulo");
+  const bEl=document.getElementById("detalle-body");
+  const enPeriodo=f=>dias===0?f===HOY:(f&&daysDiff(f)<=dias);
+  const RL={vendio:"✓ Vendió",no_compro:"No compró",reprogramar:"Reprogramar",cerrado:"Cerrado"};
+  const per=PERIODO_LBL[dias]||"";
+  const nomVend=v=>(v||"").split("@")[0];
+  const filaVisita=v=>{
+    const c=CLIENTES.find(x=>x.id===v.cid);
+    return`<tr>
+      <td class="td" style="font-size:11px;color:var(--t3);white-space:nowrap">${v.fecha}</td>
+      <td class="td" style="font-weight:600;font-size:12px">${c?.n||"Cliente"}</td>
+      <td class="td" style="font-size:11px">${TIPO_LBL[v.tipo]||v.tipo}</td>
+      <td class="td" style="font-size:11px">${RL[v.res]||"—"}</td>
+      <td class="td" style="font-size:11px;color:var(--t3)">${nomVend(v.vend)}</td>
+      <td class="td" style="font-size:12px;font-weight:700;color:var(--azul);white-space:nowrap">${v.total>0?fmt(v.total):"—"}</td>
+      <td class="td" style="font-size:12px;font-weight:700;color:var(--verde);white-space:nowrap">${v.cob>0?fmt(v.cob):"—"}</td>
+    </tr>`;
+  };
+  const tablaVisitas=lista=>`<table class="tbl"><thead><tr>
+    <th class="th">Fecha</th><th class="th">Cliente</th><th class="th">Tipo</th><th class="th">Resultado</th><th class="th">Vendedor</th><th class="th">Vendido</th><th class="th">Cobrado</th>
+  </tr></thead><tbody>${lista.map(filaVisita).join("")}</tbody></table>`;
+  const ordenar=l=>[...l].sort((a,b)=>b.fecha>a.fecha?1:-1);
+
+  let titulo="",html="";
+  const visBase=VISITAS.filter(v=>enPeriodo(v.fecha)&&(!vend||v.vend===vend));
+
+  if(tipo==="visitas"){
+    titulo=`Visitas · ${per} (${visBase.length})`;
+    html=visBase.length?tablaVisitas(ordenar(visBase)):"<p style='font-size:13px;color:var(--t3)'>Sin visitas en este período.</p>";
+  }
+  else if(tipo==="ventas"){
+    const l=visBase.filter(v=>v.res==="vendio");
+    titulo=`Ventas cerradas · ${per} (${l.length})`;
+    html=l.length?tablaVisitas(ordenar(l)):"<p style='font-size:13px;color:var(--t3)'>Sin ventas en este período.</p>";
+  }
+  else if(tipo==="vendido"){
+    const l=visBase.filter(v=>v.total>0);
+    const tot=l.reduce((s,v)=>s+v.total,0);
+    titulo=`Vendido · ${per} — ${fmt(tot)} en ${l.length} operaciones`;
+    html=l.length?tablaVisitas(ordenar(l)):"<p style='font-size:13px;color:var(--t3)'>Sin montos vendidos en este período.</p>";
+  }
+  else if(tipo==="cobrado"){
+    const l=visBase.filter(v=>v.cob>0);
+    const tot=l.reduce((s,v)=>s+v.cob,0);
+    titulo=`Cobrado · ${per} — ${fmt(tot)} en ${l.length} operaciones`;
+    html=l.length?tablaVisitas(ordenar(l)):"<p style='font-size:13px;color:var(--t3)'>Sin cobros en este período.</p>";
+  }
+  else if(tipo==="comerciales"){
+    const l=visBase.filter(v=>!["despacho","acomodo"].includes(v.tipo));
+    const ventas=l.filter(v=>v.res==="vendio").length;
+    titulo=`Visitas comerciales · ${per} (${l.length}) — ${ventas} con venta`;
+    html=l.length?tablaVisitas(ordenar(l)):"<p style='font-size:13px;color:var(--t3)'>Sin visitas comerciales.</p>";
+  }
+  else if(tipo==="clientesUnicos"){
+    const cids=[...new Set(visBase.map(v=>v.cid))];
+    const lista=cids.map(cid=>{
+      const c=CLIENTES.find(x=>x.id===cid);
+      const vis=visBase.filter(v=>v.cid===cid);
+      return{c,vis};
+    }).filter(x=>x.c);
+    titulo=`Clientes visitados · ${per} (${lista.length})`;
+    html=lista.length?`<table class="tbl"><thead><tr>
+      <th class="th">Cliente</th><th class="th">Zona</th><th class="th">Visitas</th><th class="th">Vendido</th><th class="th">Cobrado</th>
+    </tr></thead><tbody>${lista.map(({c,vis})=>`<tr>
+      <td class="td" style="font-weight:600;font-size:12px">${c.n}</td>
+      <td class="td" style="font-size:11px">${c.z||"—"}</td>
+      <td class="td">${vis.length}</td>
+      <td class="td" style="font-weight:700;color:var(--azul)">${fmt(vis.reduce((s,v)=>s+(v.total||0),0))}</td>
+      <td class="td" style="font-weight:700;color:var(--verde)">${fmt(vis.reduce((s,v)=>s+(v.cob||0),0))}</td>
+    </tr>`).join("")}</tbody></table>`:"<p style='font-size:13px;color:var(--t3)'>Sin clientes visitados.</p>";
+  }
+  else if(tipo==="clientesNuevos"){
+    const l=CLIENTES.filter(c=>enPeriodo(c.creadoEn)&&(!vend||c.vend===vend));
+    titulo=`Clientes nuevos · ${per} (${l.length})`;
+    html=l.length?`<table class="tbl"><thead><tr>
+      <th class="th">Cliente</th><th class="th">Zona</th><th class="th">Canal</th><th class="th">Vendedor</th><th class="th">Creado</th>
+    </tr></thead><tbody>${l.map(c=>`<tr>
+      <td class="td" style="font-weight:600;font-size:12px">${c.n}</td>
+      <td class="td" style="font-size:11px">${c.z||"—"}</td>
+      <td class="td" style="font-size:11px">${c.t==="fs"?"Food Service":"Retail"}</td>
+      <td class="td" style="font-size:11px;color:var(--t3)">${nomVend(c.vend)}</td>
+      <td class="td" style="font-size:11px;color:var(--t3)">${c.creadoEn||"—"}</td>
+    </tr>`).join("")}</tbody></table>`:"<p style='font-size:13px;color:var(--t3)'>Sin clientes nuevos.</p>";
+  }
+  else if(tipo==="pedidos"){
+    const l=PEDIDOS.filter(p=>enPeriodo(p.fecha)&&(!vend||p.vend===vend));
+    titulo=`Pedidos · ${per} (${l.length})`;
+    html=renderTablaPedidosDetalle(l);
+  }
+  else if(tipo==="pedidosPendientes"){
+    const l=PEDIDOS.filter(p=>p.estado==="pendiente"&&(!vend||p.vend===vend));
+    titulo=`Pedidos pendientes (${l.length})`;
+    html=renderTablaPedidosDetalle(l);
+  }
+  else if(tipo==="saldos"){
+    const l=CLIENTES.filter(c=>c.saldo>0&&(!vend||c.vend===vend)).sort((a,b)=>b.saldo-a.saldo);
+    const tot=l.reduce((s,c)=>s+c.saldo,0);
+    titulo=`Saldos pendientes — ${fmt(tot)} en ${l.length} clientes`;
+    html=l.length?`<table class="tbl"><thead><tr>
+      <th class="th">Cliente</th><th class="th">Zona</th><th class="th">Vendedor</th><th class="th">Últ. compra</th><th class="th">Saldo</th>
+    </tr></thead><tbody>${l.map(c=>`<tr>
+      <td class="td" style="font-weight:600;font-size:12px">${c.n}</td>
+      <td class="td" style="font-size:11px">${c.z||"—"}</td>
+      <td class="td" style="font-size:11px;color:var(--t3)">${nomVend(c.vend)}</td>
+      <td class="td" style="font-size:11px;color:var(--t3)">${c.ultimaCompra||"—"}</td>
+      <td class="td" style="font-weight:700;color:var(--rojo)">${fmt(c.saldo)}</td>
+    </tr>`).join("")}</tbody></table>`:"<p style='font-size:13px;color:var(--t3)'>Sin saldos pendientes.</p>";
+  }
+
+  tEl.textContent=titulo;
+  bEl.innerHTML=html;
+  modal.style.display="flex";
+};
+
+function renderTablaPedidosDetalle(l){
+  if(!l.length)return"<p style='font-size:13px;color:var(--t3)'>Sin pedidos.</p>";
+  const EST={pendiente:"🟠 Pendiente",confirmado:"🔵 Confirmado",entregado:"🟢 Entregado"};
+  return`<table class="tbl"><thead><tr>
+    <th class="th">Fecha</th><th class="th">Cliente</th><th class="th">Ítems</th><th class="th">Estado</th><th class="th">Vendedor</th><th class="th">Total</th>
+  </tr></thead><tbody>${[...l].sort((a,b)=>b.fecha>a.fecha?1:-1).map(p=>{
+    const c=CLIENTES.find(x=>x.id===p.cid);
+    return`<tr>
+      <td class="td" style="font-size:11px;color:var(--t3);white-space:nowrap">${p.fecha}</td>
+      <td class="td" style="font-weight:600;font-size:12px">${c?.n||"Cliente"}</td>
+      <td class="td" style="font-size:11px">${(p.items||[]).map(i=>`${i.nombre} x${i.qty}`).join(", ")}</td>
+      <td class="td" style="font-size:11px">${EST[p.estado]||p.estado}</td>
+      <td class="td" style="font-size:11px;color:var(--t3)">${(p.vend||"").split("@")[0]}</td>
+      <td class="td" style="font-weight:700;color:var(--azul)">${fmt(p.total)}</td>
+    </tr>`;}).join("")}</tbody></table>`;
+}
+
+
+// ── GESTIÓN DE USUARIOS (PIN) ──
 async function renderTabUsuarios(el){
   el.innerHTML=`<div class="ac"><p style="color:var(--t3);font-size:13px">Cargando usuarios...</p></div>`;
-  try{
-    const snap=await getDocs(collection(db,"usuarios"));
-    let usuarios=snap.docs.map(d=>({id:d.id,...d.data()}));
-    usuarios.sort((a,b)=>a.email>b.email?1:-1);
-    el.innerHTML=`<div class="ac">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px">
-        <div class="ac-title" style="margin-bottom:0">Usuarios del sistema (${usuarios.length})</div>
-        <button onclick="abrirAgregarUsuario()" style="background:var(--azul);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit">+ Agregar usuario</button>
-      </div>
-      <div style="background:var(--azul-light);border:1.5px solid var(--azul);border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:12px;color:var(--azul);line-height:1.6">
-        <b>¿Cómo agregar un vendedor?</b><br>
-        1. Toca "+ Agregar usuario" y pega el Gmail o correo corporativo exacto.<br>
-        2. La próxima vez que esa persona entre al sistema, ya va a poder acceder.<br>
-        3. No hace falta hacer deploy ni editar código.
-      </div>
-      <table class="tbl"><thead><tr>
-        <th class="th">Email</th><th class="th">Rol</th><th class="th">Estado</th><th class="th">Desde</th><th class="th">Acción</th>
-      </tr></thead><tbody>
-      ${usuarios.map(u=>`<tr>
-        <td class="td" style="font-size:12px;word-break:break-all">${u.email}</td>
-        <td class="td"><span style="background:${u.rol==='admin'?'var(--azul-light)':'var(--verde-light)'};color:${u.rol==='admin'?'var(--azul)':'var(--verde)'};border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700">${u.rol==='admin'?'Admin':'Vendedor'}</span></td>
-        <td class="td"><span style="background:${u.activo!==false?'var(--verde-light)':'#FEE2E2'};color:${u.activo!==false?'var(--verde)':'var(--rojo)'};border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700">${u.activo!==false?'Activo':'Inactivo'}</span></td>
-        <td class="td" style="font-size:11px;color:var(--t3)">${u.creadoEn||'—'}</td>
-        <td class="td">
-          ${ADMINS.includes(u.email)?`<span style="font-size:11px;color:var(--t3)">Admin fijo</span>`:`
-          <button onclick="toggleUsuario('${u.email}',${u.activo!==false})" style="background:${u.activo!==false?'#FEE2E2':'var(--verde-light)'};color:${u.activo!==false?'var(--rojo)':'var(--verde)'};border:none;border-radius:6px;padding:5px 10px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit">${u.activo!==false?'Desactivar':'Activar'}</button>
-          <button onclick="eliminarUsuario('${u.email}')" style="background:none;border:1.5px solid var(--rojo);color:var(--rojo);border-radius:6px;padding:5px 10px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;margin-left:4px">✕</button>`}
-        </td>
-      </tr>`).join("")}
-      </tbody></table>
-    </div>`;
-  }catch(e){
-    el.innerHTML=`<div class="ac"><p style="color:var(--rojo)">Error al cargar usuarios: ${e.message}</p></div>`;
-  }
+  await cargarUsuarios();
+  const usuarios=[...USUARIOS_CACHE].sort((a,b)=>(a.rol===b.rol?(a.nombre||"").localeCompare(b.nombre||""):a.rol==="admin"?-1:1));
+  el.innerHTML=`<div class="ac">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+      <div class="ac-title" style="margin-bottom:0">Usuarios del sistema (${usuarios.length})</div>
+      <button onclick="abrirAgregarUsuario()" style="background:var(--azul);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit">+ Agregar usuario</button>
+    </div>
+    <div style="background:var(--azul-light);border:1.5px solid var(--azul);border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:12px;color:var(--azul);line-height:1.6">
+      <b>Login por PIN:</b> cada usuario entra tocando su nombre y su PIN de 4 dígitos. Los cambios aquí aplican de inmediato, sin deploy.
+    </div>
+    <table class="tbl"><thead><tr>
+      <th class="th">Nombre</th><th class="th">Usuario</th><th class="th">Rol</th><th class="th">Estado</th><th class="th">PIN</th><th class="th">Acciones</th>
+    </tr></thead><tbody>
+    ${usuarios.map(u=>`<tr>
+      <td class="td" style="font-weight:600;font-size:12px">${u.nombre||u.u}${u.dual?' <span style="font-size:10px;color:var(--t3)">(dual)</span>':""}</td>
+      <td class="td" style="font-size:12px;font-family:'DM Mono',monospace">${u.u}</td>
+      <td class="td"><span style="background:${u.rol==='admin'?'var(--azul-light)':'var(--verde-light)'};color:${u.rol==='admin'?'var(--azul)':'var(--verde)'};border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700">${u.rol==='admin'?'Casa Matriz':'Vendedor'}</span></td>
+      <td class="td"><span style="background:${u.activo!==false?'var(--verde-light)':'#FEE2E2'};color:${u.activo!==false?'var(--verde)':'var(--rojo)'};border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700">${u.activo!==false?'Activo':'Inactivo'}</span></td>
+      <td class="td" style="font-family:'DM Mono',monospace;font-size:12px">••••</td>
+      <td class="td" style="white-space:nowrap">
+        <button onclick="cambiarPinUsuario('${u.u}')" style="background:var(--azul-light);border:none;border-radius:6px;padding:5px 10px;color:var(--azul);font-size:11px;font-weight:700;cursor:pointer;font-family:inherit">🔑 PIN</button>
+        ${u.u==="dcapiello"?`<span style="font-size:10px;color:var(--t3);margin-left:4px">admin principal</span>`:`
+        <button onclick="toggleUsuario('${u.u}',${u.activo!==false})" style="background:${u.activo!==false?'#FEE2E2':'var(--verde-light)'};color:${u.activo!==false?'var(--rojo)':'var(--verde)'};border:none;border-radius:6px;padding:5px 10px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;margin-left:4px">${u.activo!==false?'Desactivar':'Activar'}</button>
+        <button onclick="eliminarUsuario('${u.u}')" style="background:none;border:1.5px solid var(--rojo);color:var(--rojo);border-radius:6px;padding:5px 10px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;margin-left:4px">✕</button>`}
+      </td>
+    </tr>`).join("")}
+    </tbody></table>
+  </div>
+  <div class="ac" style="margin-top:16px;border:1.5px solid var(--rojo)">
+    <div class="ac-title" style="color:var(--rojo)">⚠️ Zona de mantenimiento</div>
+    <p style="font-size:13px;color:var(--t2);margin-bottom:12px;line-height:1.6">
+      <b>Reset del sistema:</b> borra todas las <b>visitas, pedidos y alarmas</b> (datos demo o de prueba).
+      <b>Mantiene</b> los clientes y los usuarios. Esta acción no se puede deshacer.
+    </p>
+    <button onclick="resetSistema()" style="background:var(--rojo);color:#fff;border:none;border-radius:8px;padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit">🗑️ Reset del sistema</button>
+  </div>`;
 }
 
 window.abrirAgregarUsuario=function(){
-  const email=prompt("Email del nuevo usuario (Gmail o correo corporativo):");
-  if(!email||!email.includes("@")){if(email!==null)toast("⚠️ Email inválido");return;}
-  const emailLower=email.trim().toLowerCase();
-  const rol=confirm("¿Es administrador (Casa Matriz)?\nOK = Admin\nCancelar = Vendedor")?"admin":"vendedor";
-  agregarUsuario(emailLower,rol);
+  const nombre=prompt("Nombre completo del usuario:");
+  if(!nombre)return;
+  const u=prompt("Usuario (corto, sin espacios — ej: jperez):");
+  if(!u||/\s/.test(u)){if(u!==null)toast("⚠️ Usuario inválido (sin espacios)");return;}
+  const uLower=u.trim().toLowerCase();
+  if(USUARIOS_CACHE.some(x=>x.u===uLower)){toast("⚠️ Ese usuario ya existe");return;}
+  const rol=confirm("¿Es de Casa Matriz (admin)?\nOK = Casa Matriz\nCancelar = Vendedor")?"admin":"vendedor";
+  const pin=prompt("PIN de 4 dígitos para este usuario:",rol==="admin"?PIN_ADMIN:PIN_VENDEDOR);
+  if(!pin||!/^\d{4}$/.test(pin)){toast("⚠️ El PIN debe ser 4 dígitos");return;}
+  const email=prompt("Email (opcional, para asociar datos):")||`${uLower}@invepaca.local`;
+  agregarUsuario(uLower,nombre.trim(),email.trim().toLowerCase(),rol,pin);
 };
 
-window.agregarUsuario=async function(email,rol){
+window.agregarUsuario=async function(u,nombre,email,rol,pin){
   try{
-    await setDoc(doc(db,"usuarios",email),{email,rol,activo:true,creadoEn:HOY,creadoPor:CU.email});
-    toast(`✓ ${email} añadido como ${rol}`);
+    const colores=["#1A4FA0","#E8620A","#2E8B4A","#4A7FCC","#8E44AD","#C0392B"];
+    await setDoc(doc(db,"usuarios",u),{u,nombre,email,rol,pin,dual:false,activo:true,
+      color:colores[Math.floor(Math.random()*colores.length)],creadoEn:HOY,creadoPor:CU.email});
+    toast(`✓ ${nombre} añadido como ${rol==="admin"?"Casa Matriz":"vendedor"}`);
     renderTabUsuarios(document.getElementById("adm-content"));
   }catch(e){toast("Error: "+e.message,4000);}
 };
 
-window.toggleUsuario=async function(email,estaActivo){
+window.cambiarPinUsuario=async function(u){
+  const usuario=USUARIOS_CACHE.find(x=>x.u===u);
+  if(!usuario)return;
+  const pin=prompt(`Nuevo PIN de 4 dígitos para ${usuario.nombre||u}:`);
+  if(pin===null)return;
+  if(!/^\d{4}$/.test(pin)){toast("⚠️ El PIN debe ser exactamente 4 dígitos");return;}
+  try{
+    await updateDoc(doc(db,"usuarios",u),{pin});
+    toast(`✓ PIN de ${usuario.nombre||u} actualizado`);
+    renderTabUsuarios(document.getElementById("adm-content"));
+  }catch(e){toast("Error: "+e.message,4000);}
+};
+
+window.toggleUsuario=async function(u,estaActivo){
+  const usuario=USUARIOS_CACHE.find(x=>x.u===u);
   const accion=estaActivo?"desactivar":"activar";
-  if(!confirm(`¿${accion.charAt(0).toUpperCase()+accion.slice(1)} el acceso de ${email}?`))return;
+  if(!confirm(`¿${accion.charAt(0).toUpperCase()+accion.slice(1)} el acceso de ${usuario?.nombre||u}?`))return;
   try{
-    await updateDoc(doc(db,"usuarios",email),{activo:!estaActivo});
-    toast(`✓ Usuario ${accion==="desactivar"?"desactivado":"activado"}`);
+    await updateDoc(doc(db,"usuarios",u),{activo:!estaActivo});
+    toast(`✓ Usuario ${estaActivo?"desactivado":"activado"}`);
     renderTabUsuarios(document.getElementById("adm-content"));
   }catch(e){toast("Error: "+e.message,4000);}
 };
 
-window.eliminarUsuario=async function(email){
-  if(!confirm(`¿Eliminar permanentemente el acceso de ${email}?\nEsta acción no se puede deshacer.`))return;
+window.eliminarUsuario=async function(u){
+  const usuario=USUARIOS_CACHE.find(x=>x.u===u);
+  if(!confirm(`¿Eliminar permanentemente a ${usuario?.nombre||u}?\nEsta acción no se puede deshacer.`))return;
   try{
-    await deleteDoc(doc(db,"usuarios",email));
-    toast(`✓ ${email} eliminado`);
+    await deleteDoc(doc(db,"usuarios",u));
+    toast(`✓ Usuario eliminado`);
     renderTabUsuarios(document.getElementById("adm-content"));
   }catch(e){toast("Error: "+e.message,4000);}
+};
+
+// ── RESET DEL SISTEMA ──
+window.resetSistema=async function(){
+  if(!confirm("⚠️ RESET DEL SISTEMA\n\nSe van a borrar TODAS las visitas, pedidos y alarmas.\nLos clientes y usuarios se mantienen.\n\n¿Continuar?"))return;
+  // Re-validación con PIN del usuario actual (como acordamos)
+  const miUsuario=USUARIOS_CACHE.find(x=>x.email===CU.email);
+  const pinIngresado=prompt("Para confirmar, ingresa tu PIN:");
+  if(pinIngresado===null)return;
+  if(!miUsuario||pinIngresado!==miUsuario.pin){toast("❌ PIN incorrecto. Reset cancelado.",4000);return;}
+  toast("🗑️ Borrando datos... no cierres la página",6000);
+  try{
+    let borrados=0;
+    for(const col of ["visitas","pedidos","alarmas"]){
+      const snap=await getDocs(collection(db,col));
+      for(const d of snap.docs){
+        await deleteDoc(doc(db,col,d.id));
+        borrados++;
+      }
+    }
+    // Resetear campos de actividad en clientes
+    const cliSnap=await getDocs(collection(db,"clientes"));
+    for(const d of cliSnap.docs){
+      await updateDoc(doc(db,"clientes",d.id),{ultimaVisita:"",ultimaCompra:"",saldo:0});
+    }
+    toast(`✓ Reset completado. ${borrados} registros eliminados. Recargando...`,4000);
+    setTimeout(()=>location.reload(),2500);
+  }catch(e){toast("Error durante el reset: "+e.message,6000);}
 };
 
 // ── ALARMAS VENDEDOR ──
@@ -3276,6 +3500,18 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--page);color:var
         <div id="mapa-vend-todos" style="height:320px;border-radius:var(--rad);overflow:hidden;background:#e8e8e8"></div>
       </div>
     </div>
+  </div>
+</div>
+
+
+<!-- MODAL DETALLE DE ESTADÍSTICAS -->
+<div id="detalle-modal" style="display:none;position:fixed;inset:0;background:rgba(10,20,40,.5);z-index:9000;align-items:center;justify-content:center;padding:16px" onclick="if(event.target===this)cerrarDetalle()">
+  <div style="background:#fff;border-radius:16px;max-width:760px;width:100%;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--gris);flex-shrink:0">
+      <b id="detalle-titulo" style="font-size:14px"></b>
+      <button onclick="cerrarDetalle()" style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--t3);padding:0 4px">✕</button>
+    </div>
+    <div id="detalle-body" style="overflow-y:auto;padding:14px 18px"></div>
   </div>
 </div>
 
